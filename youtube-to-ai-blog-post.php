@@ -2,7 +2,7 @@
 /**
  * Plugin Name: YouTube To AI Blog Post
  * Description: Turn a YouTube link into a draft blog post using YouTube Transcript and OpenAI.
- * Version: 6.0.3
+ * Version: 6.1.3
  * Author: Daniel Reguero
  * Author URI: https://vibechecktech.com
  * License: GPL v2 or later
@@ -16,21 +16,30 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+require_once __DIR__ . '/includes/trait-ytaibp-automation.php';
+
 class Ytaibp_Main {
+
+    use Ytaibp_Automation;
 
     private $prefix = 'ytaibp_';
     private $slug = 'youtube-to-ai-blog-post';
-    private $version = '6.0.3';
+    private $version = '6.1.3';
 
     public function __construct() {
         add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
         add_action( 'admin_post_ytaibp_save_settings', array( $this, 'save_settings' ) );
         add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
         add_action( 'wp_ajax_ytaibp_create_draft', array( $this, 'create_draft' ) );
+        add_action( 'init', array( $this, 'schedule_cron' ) );
+        add_action( 'ytaibp_check_youtube', array( $this, 'check_youtube' ) );
+        register_deactivation_hook( __FILE__, array( $this, 'stop_automation' ) );
     }
 
     private function defaults() {
         return array(
+            'plugin_enabled' => '0',
+            'channel_id' => '',
             'transcript_api_key' => '',
             'openai_api_key' => '',
             'openai_model' => 'gpt-4o-mini',
@@ -66,7 +75,19 @@ class Ytaibp_Main {
         }
         check_admin_referer( 'ytaibp_save_settings', 'ytaibp_save_nonce' );
 
+        $previous = $this->settings();
+        $channel_input = isset( $_POST['ytaibp_channel_id'] ) && is_string( $_POST['ytaibp_channel_id'] ) ? trim( wp_unslash( $_POST['ytaibp_channel_id'] ) ) : '';
+        $channel_id = $this->channel_id_from_input( $channel_input );
+        $enabled = isset( $_POST['ytaibp_plugin_enabled'] ) && '1' === $_POST['ytaibp_plugin_enabled'];
+        if ( ( '' !== $channel_input && ! $channel_id ) || ( $enabled && ! $channel_id ) ) {
+            wp_die( esc_html__( 'Enter a channel ID beginning with UC or a youtube.com/channel/UC... URL. Handle URLs are not supported yet.', 'youtube-to-ai-blog-post' ) );
+        }
+
+        $updated = array();
         foreach ( $this->defaults() as $name => $default ) {
+            if ( in_array( $name, array( 'plugin_enabled', 'channel_id' ), true ) ) {
+                continue;
+            }
             $key = $this->prefix . $name;
             if ( ! isset( $_POST[ $key ] ) || ! is_string( $_POST[ $key ] ) ) {
                 continue;
@@ -90,8 +111,23 @@ class Ytaibp_Main {
             if ( in_array( $name, array( 'openai_model', 'openai_system_prompt' ), true ) && '' === trim( $value ) ) {
                 $value = $default;
             }
-            update_option( $key, $value, false );
+            $updated[ $name ] = $value;
         }
+
+        $settings = array_merge( $previous, $updated );
+        if ( $enabled && ( '' === $settings['transcript_api_key'] || '' === $settings['openai_api_key'] || ! user_can( $settings['post_author'], 'edit_posts' ) ) ) {
+            wp_die( esc_html__( 'Save both API credentials and select an author who can edit posts before enabling automatic imports.', 'youtube-to-ai-blog-post' ) );
+        }
+        foreach ( $updated as $name => $value ) {
+            update_option( $this->prefix . $name, $value, false );
+        }
+        if ( ! $enabled || '1' !== $previous['plugin_enabled'] || $channel_id !== $previous['channel_id'] ) {
+            update_option( $this->prefix . 'plugin_enabled', '0', false );
+            $this->stop_automation();
+        }
+        update_option( $this->prefix . 'channel_id', $channel_id ? $channel_id : '', false );
+        update_option( $this->prefix . 'plugin_enabled', $enabled ? '1' : '0', false );
+        $this->schedule_cron();
 
         wp_safe_redirect( admin_url( 'options-general.php?page=' . $this->slug . '&ytaibp_saved=1' ) );
         exit;
@@ -181,11 +217,14 @@ class Ytaibp_Main {
             ytaibp_link(ytaibp_response.data.preview_url, ytaibp_config.preview);
             ytaibp_result.appendChild(document.createTextNode(' · '));
             ytaibp_link(ytaibp_response.data.edit_url, ytaibp_config.edit);
+            if (ytaibp_response.data.thumbnail_warning) {
+                ytaibp_result.appendChild(document.createTextNode(' ' + ytaibp_response.data.thumbnail_warning));
+            }
             document.getElementById('ytaibp-video-url').value = '';
         }
         ytaibp_request.open('POST', ytaibp_config.url, true);
-        // Allow a small transport margin beyond the server's two-minute deadline.
-        ytaibp_request.timeout = 125000;
+        // Generation has two minutes; optional media gets a separate 20 seconds.
+        ytaibp_request.timeout = 150000;
         ytaibp_request.onload = function () {
             var ytaibp_response = null;
             if (ytaibp_request.responseText) {
@@ -263,6 +302,7 @@ JS;
                         <p><label for="ytaibp-post-template"><?php esc_html_e( 'Post template', 'youtube-to-ai-blog-post' ); ?></label></p>
                         <textarea id="ytaibp-post-template" name="ytaibp_post_template" class="large-text code" rows="10"><?php echo esc_textarea( $settings['post_template'] ); ?></textarea>
                         <p class="description"><?php esc_html_e( 'Placeholders: {summary}, {video_embed}, {description}, {title}, {video_url}, {video_id}, {channel_url}, {published_date}, {transcript}. Leave blank to use the default template.', 'youtube-to-ai-blog-post' ); ?></p>
+                        <?php $this->automation_settings_fields( $settings ); ?>
                         <?php submit_button( __( 'Save settings', 'youtube-to-ai-blog-post' ) ); ?>
                     </fieldset>
                 </form>
@@ -345,65 +385,87 @@ JS;
             return;
         }
 
-        // Request state stays in memory. No IDs, jobs, or retries are stored.
-        $deadline = microtime( true ) + 120;
-        if ( function_exists( 'set_time_limit' ) ) {
-            @set_time_limit( 125 );
-        }
-        $post_id = 0;
-        $attachment_id = 0;
-        try {
-            $video = $this->fetch_video( $video_id, $settings['transcript_api_key'], $deadline );
-            if ( is_wp_error( $video ) ) {
-                $this->fail( 502, $video );
-                return;
-            }
-            $summary = $this->generate_summary( $video, $settings, $deadline );
-            if ( is_wp_error( $summary ) ) {
-                $this->fail( 502, $summary );
-                return;
-            }
-            if ( microtime( true ) >= $deadline || connection_aborted() ) {
-                $this->fail( 504, new WP_Error( 'ytaibp_timeout', __( 'The processing time limit was reached.', 'youtube-to-ai-blog-post' ) ) );
-                return;
-            }
-            $post_id = $this->insert_draft( $video, $summary, $settings );
-            if ( is_wp_error( $post_id ) || ! $post_id ) {
-                $post_error = is_wp_error( $post_id ) ? $post_id : new WP_Error( 'ytaibp_post_failed', __( 'WordPress could not save the draft.', 'youtube-to-ai-blog-post' ) );
-                $post_id = 0;
-                $this->fail( 500, $post_error );
-                return;
-            }
-            // A thumbnail is optional. Its timeout shares the same overall budget.
-            $attachment_id = $this->set_thumbnail( $post_id, $video, $deadline );
-            if ( microtime( true ) >= $deadline || connection_aborted() ) {
-                $this->discard_draft( $post_id, $attachment_id );
-                $this->fail();
-                return;
-            }
-            $preview_url = get_preview_post_link( $post_id );
-            if ( ! $preview_url ) {
-                $this->discard_draft( $post_id, $attachment_id );
-                $this->fail();
-                return;
-            }
-        } catch ( Throwable $error ) {
-            $this->discard_draft( $post_id, $attachment_id );
-            $this->fail( 500, new WP_Error( 'ytaibp_processing_failed', __( 'An unexpected server error interrupted processing.', 'youtube-to-ai-blog-post' ) ) );
+        $post_id = $this->generate_draft( $video_id, $settings );
+        if ( is_wp_error( $post_id ) ) {
+            $this->fail( 502, $post_id );
             return;
         }
         wp_send_json_success( array(
-            'preview_url' => esc_url_raw( $preview_url ),
+            'preview_url' => esc_url_raw( get_preview_post_link( $post_id ) ),
             'edit_url' => esc_url_raw( get_edit_post_link( $post_id, 'raw' ) ),
+            'thumbnail_warning' => get_post_meta( $post_id, '_ytaibp_thumbnail_error', true ),
         ) );
     }
 
-    private function discard_draft( $post_id, $attachment_id ) {
-        if ( $attachment_id ) {
-            wp_delete_attachment( $attachment_id, true );
+    private function source_guid( $video_id ) {
+        return home_url( '/?ytaibp_video=' . $video_id );
+    }
+
+    private function existing_video_post( $video_id ) {
+        global $wpdb;
+        // GUID is written in the post row itself, so recovery also works if a process
+        // dies between inserting the post and adding its source metadata.
+        return (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT p.ID FROM {$wpdb->posts} p WHERE p.post_type = 'post' AND p.post_status <> 'trash' AND (p.guid = %s OR EXISTS (SELECT 1 FROM {$wpdb->postmeta} m WHERE m.post_id = p.ID AND m.meta_key = '_ytaibp_video_id' AND m.meta_value = %s)) ORDER BY p.ID ASC LIMIT 1",
+            $this->source_guid( $video_id ), $video_id
+        ) );
+    }
+
+    private function generate_draft( $video_id, $settings, $session = '' ) {
+        $lock_name = $this->prefix . 'video_lock_' . $video_id;
+        $lock = $this->acquire_lock( $lock_name );
+        if ( ! $lock ) {
+            return new WP_Error( 'ytaibp_video_busy', __( 'This video is already being processed. Check your posts before trying again.', 'youtube-to-ai-blog-post' ) );
         }
-        if ( $post_id ) {
-            wp_delete_post( $post_id, true );
+        $deadline = microtime( true ) + 120;
+        if ( function_exists( 'set_time_limit' ) ) {
+            @set_time_limit( 145 );
+        }
+        $post_id = 0;
+        try {
+            if ( '' !== $session && ! $this->automation_is_current( $session ) ) {
+                return new WP_Error( 'ytaibp_import_stopped', __( 'Automatic imports were stopped.', 'youtube-to-ai-blog-post' ) );
+            }
+            $post_id = $this->existing_video_post( $video_id );
+            if ( $post_id ) {
+                // Repair missing media without another transcript/AI request.
+                $this->set_thumbnail( $post_id, array( 'id' => $video_id, 'title' => get_the_title( $post_id ), 'thumbnail' => '' ), microtime( true ) + 20 );
+                return $post_id;
+            }
+            if ( ! user_can( absint( $settings['post_author'] ), 'edit_posts' ) ) {
+                return new WP_Error( 'ytaibp_invalid_author', __( 'Select a post author who can edit posts.', 'youtube-to-ai-blog-post' ) );
+            }
+            if ( '' === trim( $settings['transcript_api_key'] ) || '' === trim( $settings['openai_api_key'] ) ) {
+                return new WP_Error( 'ytaibp_missing_credentials', __( 'Save both API credentials before importing videos.', 'youtube-to-ai-blog-post' ) );
+            }
+            $video = $this->fetch_video( $video_id, $settings['transcript_api_key'], $deadline );
+            if ( is_wp_error( $video ) ) {
+                return $video;
+            }
+            if ( '' !== $session && ! $this->automation_is_current( $session ) ) {
+                return new WP_Error( 'ytaibp_import_stopped', __( 'Automatic imports were stopped.', 'youtube-to-ai-blog-post' ) );
+            }
+            $summary = $this->generate_summary( $video, $settings, $deadline );
+            if ( is_wp_error( $summary ) ) {
+                return $summary;
+            }
+            if ( microtime( true ) >= $deadline ) {
+                return new WP_Error( 'ytaibp_timeout', __( 'The processing time limit was reached.', 'youtube-to-ai-blog-post' ) );
+            }
+            if ( '' !== $session && ! $this->automation_is_current( $session ) ) {
+                return new WP_Error( 'ytaibp_import_stopped', __( 'Automatic imports were stopped.', 'youtube-to-ai-blog-post' ) );
+            }
+            $post_id = $this->insert_draft( $video, $summary, $settings );
+            if ( is_wp_error( $post_id ) || ! $post_id ) {
+                return is_wp_error( $post_id ) ? $post_id : new WP_Error( 'ytaibp_post_failed', __( 'WordPress could not save the draft.', 'youtube-to-ai-blog-post' ) );
+            }
+            // Once saved, retain the draft even if optional media work times out.
+            $this->set_thumbnail( $post_id, $video, microtime( true ) + 20 );
+            return $post_id;
+        } catch ( Throwable $error ) {
+            return $post_id && ! is_wp_error( $post_id ) ? $post_id : new WP_Error( 'ytaibp_processing_failed', __( 'An unexpected server error interrupted processing.', 'youtube-to-ai-blog-post' ) );
+        } finally {
+            $this->release_lock( $lock_name, $lock );
         }
     }
 
@@ -555,12 +617,17 @@ JS;
             '{transcript}' => esc_html( $video['transcript'] ),
         ) );
         $author = absint( $settings['post_author'] );
+        if ( ! user_can( $author, 'edit_posts' ) ) {
+            return new WP_Error( 'ytaibp_invalid_author', __( 'Select a post author who can edit posts.', 'youtube-to-ai-blog-post' ) );
+        }
         $post = array(
             'post_title' => $video['title'],
             'post_content' => wp_kses_post( $content ),
             'post_status' => 'draft',
             'post_type' => 'post',
-            'post_author' => user_can( $author, 'edit_posts' ) ? $author : get_current_user_id(),
+            'post_author' => $author,
+            'guid' => $this->source_guid( $video['id'] ),
+            'meta_input' => array( '_ytaibp_video_id' => $video['id'] ),
         );
         $category = absint( $settings['post_category'] );
         if ( $category && term_exists( $category, 'category' ) ) {
@@ -581,48 +648,97 @@ JS;
         return wp_kses_post( $html );
     }
 
-    private function set_thumbnail( $post_id, $video, $deadline ) {
-        $timeout = $this->request_timeout( $deadline, 10, 8 );
-        $url = esc_url_raw( $video['thumbnail'] );
+    private function allowed_thumbnail_url( $url ) {
         $parts = wp_parse_url( $url );
         // The service response must never cause a request to an arbitrary host.
-        if ( ! $timeout || ! is_array( $parts ) || empty( $parts['host'] ) || ! isset( $parts['scheme'] ) || 'https' !== $parts['scheme'] || ! in_array( strtolower( $parts['host'] ), array( 'i.ytimg.com', 'img.youtube.com', 'i1.ytimg.com', 'i2.ytimg.com', 'i3.ytimg.com', 'i4.ytimg.com' ), true ) || isset( $parts['user'] ) || isset( $parts['pass'] ) || isset( $parts['port'] ) ) {
+        return is_array( $parts ) && ! empty( $parts['host'] ) && isset( $parts['scheme'] ) && 'https' === strtolower( $parts['scheme'] ) && in_array( strtolower( $parts['host'] ), array( 'i.ytimg.com', 'img.youtube.com', 'i1.ytimg.com', 'i2.ytimg.com', 'i3.ytimg.com', 'i4.ytimg.com' ), true ) && ! isset( $parts['user'] ) && ! isset( $parts['pass'] ) && ! isset( $parts['port'] );
+    }
+
+    private function set_thumbnail( $post_id, $video, $deadline ) {
+        if ( has_post_thumbnail( $post_id ) ) {
+            delete_post_meta( $post_id, '_ytaibp_thumbnail_error' );
+            return get_post_thumbnail_id( $post_id );
+        }
+        if ( ! preg_match( '/^[A-Za-z0-9_-]{11}$/D', $video['id'] ) ) {
+            update_post_meta( $post_id, '_ytaibp_thumbnail_error', __( 'The draft was saved, but its video ID is invalid for thumbnail retrieval.', 'youtube-to-ai-blog-post' ) );
             return 0;
         }
+        $urls = array();
+        if ( ! empty( $video['thumbnail'] ) && $this->allowed_thumbnail_url( $video['thumbnail'] ) ) {
+            $urls[] = $video['thumbnail'];
+        }
+        // Public CDN fallbacks work even when transcript metadata has no image.
+        $urls[] = 'https://i.ytimg.com/vi/' . $video['id'] . '/maxresdefault.jpg';
+        $urls[] = 'https://i.ytimg.com/vi/' . $video['id'] . '/hqdefault.jpg';
         $temporary = '';
         $attachment_id = 0;
+        $message = __( 'YouTube thumbnail downloads failed. Check whether your server can reach i.ytimg.com.', 'youtube-to-ai-blog-post' );
         try {
-            require_once ABSPATH . 'wp-admin/includes/file.php';
-            require_once ABSPATH . 'wp-admin/includes/media.php';
-            require_once ABSPATH . 'wp-admin/includes/image.php';
-            $temporary = download_url( $url, $timeout );
-            if ( is_wp_error( $temporary ) ) {
-                return 0;
+            if ( ! function_exists( 'download_url' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/file.php';
             }
-            if ( $this->request_timeout( $deadline, 10, 8 ) < 1 ) {
-                wp_delete_file( $temporary );
-                return 0;
+            if ( ! function_exists( 'media_handle_sideload' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/media.php';
             }
-            $file = array( 'name' => sanitize_file_name( $video['id'] ) . '.jpg', 'tmp_name' => $temporary );
-            $attachment_id = media_handle_sideload( $file, $post_id, $video['title'] );
-            if ( is_wp_error( $attachment_id ) ) {
-                wp_delete_file( $temporary );
-                return 0;
+            if ( ! function_exists( 'wp_generate_attachment_metadata' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/image.php';
             }
-            if ( ! set_post_thumbnail( $post_id, $attachment_id ) ) {
-                wp_delete_attachment( $attachment_id, true );
-                return 0;
+            foreach ( array_unique( $urls ) as $url ) {
+                $timeout = $this->request_timeout( $deadline, 5, 3 );
+                if ( ! $timeout ) {
+                    $message = __( 'Thumbnail retrieval ran out of time. Submit the same video again to retry its image without regenerating the post.', 'youtube-to-ai-blog-post' );
+                    break;
+                }
+                $temporary = download_url( $url, $timeout );
+                if ( is_wp_error( $temporary ) ) {
+                    $message = __( 'Thumbnail download failed: ', 'youtube-to-ai-blog-post' ) . $this->redact_diagnostic( $temporary->get_error_message() );
+                    $temporary = '';
+                    continue;
+                }
+                $image = @getimagesize( $temporary );
+                $extensions = array( 'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp' );
+                if ( ! $image || empty( $image['mime'] ) || ! isset( $extensions[ $image['mime'] ] ) || $image[0] < 320 || $image[1] < 180 ) {
+                    // YouTube sometimes serves a tiny placeholder for unavailable sizes.
+                    wp_delete_file( $temporary );
+                    $temporary = '';
+                    $message = __( 'YouTube returned an invalid image or a small placeholder instead of a usable thumbnail.', 'youtube-to-ai-blog-post' );
+                    continue;
+                }
+                if ( ! $this->request_timeout( $deadline, 5, 1 ) ) {
+                    $message = __( 'There was not enough time to save the thumbnail. Submit the same video again to retry its image.', 'youtube-to-ai-blog-post' );
+                    break;
+                }
+                $file = array( 'name' => sanitize_file_name( $video['id'] ) . '.' . $extensions[ $image['mime'] ], 'tmp_name' => $temporary );
+                $attachment_id = media_handle_sideload( $file, $post_id, $video['title'] );
+                if ( is_wp_error( $attachment_id ) ) {
+                    $message = __( 'WordPress could not save the thumbnail in the Media Library: ', 'youtube-to-ai-blog-post' ) . $this->redact_diagnostic( $attachment_id->get_error_message() );
+                    $attachment_id = 0;
+                    wp_delete_file( $temporary );
+                    $temporary = '';
+                    continue;
+                }
+                $temporary = ''; // WordPress moved the uploaded file.
+                if ( ! set_post_thumbnail( $post_id, $attachment_id ) ) {
+                    wp_delete_attachment( $attachment_id, true );
+                    $attachment_id = 0;
+                    $message = __( 'WordPress saved the image but could not assign it as the featured image.', 'youtube-to-ai-blog-post' );
+                    break;
+                }
+                delete_post_meta( $post_id, '_ytaibp_thumbnail_error' );
+                return $attachment_id;
             }
         } catch ( Throwable $error ) {
             if ( $attachment_id && ! is_wp_error( $attachment_id ) ) {
                 wp_delete_attachment( $attachment_id, true );
             }
+            $message = __( 'An unexpected error interrupted thumbnail retrieval. Submit the same video again to retry its image.', 'youtube-to-ai-blog-post' );
+        } finally {
             if ( is_string( $temporary ) && '' !== $temporary && file_exists( $temporary ) ) {
                 wp_delete_file( $temporary );
             }
-            return 0;
         }
-        return $attachment_id;
+        update_post_meta( $post_id, '_ytaibp_thumbnail_error', __( 'Draft saved without a featured image. ', 'youtube-to-ai-blog-post' ) . $message );
+        return 0;
     }
 }
 
